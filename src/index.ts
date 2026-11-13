@@ -23,13 +23,10 @@ export class GotScrapingClient extends BaseClient<GotScrapingProxy> implements C
         const module = await loadEsm("got-scraping")
         const gotScraping: GotScraping = module.gotScraping
 
-        this.gotScrapingInstance = gotScraping.extend({
-            ...this.options,
-            headers: {
-                "User-Agent": this.currentUserAgent ?? defaultUserAgent
-            },
-            proxyUrl: this.currentProxy,
-        })
+        // userAgent, proxy and proxyUrl are Xcrap options resolved on every request, not got options
+        const { userAgent: _userAgent, proxy: _proxy, proxyUrl: _proxyUrl, ...gotOptions } = this.options as GotScrapingClientOptions & { proxyUrl?: unknown }
+
+        this.gotScrapingInstance = gotScraping.extend(gotOptions)
     }
 
     protected async ensureGotScraping(): Promise<void> {
@@ -51,10 +48,14 @@ export class GotScrapingClient extends BaseClient<GotScrapingProxy> implements C
         const failedAttempts: FaliedAttempt[] = []
 
         const attemptRequest = async (currentRetry: number): Promise<HttpResponse> => {
+            let response: Response | undefined
+            let errorMessage: string
+
             try {
                 const fullUrl = this.currentProxyUrl ? `${this.currentProxyUrl}${url}` : url
 
-                const response = await this.gotScrapingInstance!({
+                response = await this.gotScrapingInstance!({
+                    ...gotOptions,
                     url: fullUrl,
                     method: method,
                     headers: {
@@ -62,45 +63,54 @@ export class GotScrapingClient extends BaseClient<GotScrapingProxy> implements C
                         ...gotOptions.headers
                     },
                     proxyUrl: this.currentProxy,
-                    ...gotOptions
                 }) as Response
 
-                if (!this.isSuccess(response.statusCode)) {
-                    throw new InvalidStatusCodeError(response.statusCode)
+                if (this.isSuccess(response.statusCode)) {
+                    return this.toHttpResponse(response, currentRetry, failedAttempts)
                 }
 
-                return new HttpResponse({
-                    status: response.statusCode,
-                    statusText: response.statusMessage || "OK",
-                    headers: response.headers,
-                    body: response.body,
-                    attempts: currentRetry + 1,
-                    failedAttempts,
-                })
+                errorMessage = new InvalidStatusCodeError(response.statusCode, fullUrl).message
             } catch (error: any) {
-                const errorMessage = error instanceof Error ? error.message : "Unknown error"
-                failedAttempts.push({ error: errorMessage, timestamp: new Date() })
+                errorMessage = error instanceof Error ? error.message : "Unknown error"
+                response = error.response
+            }
 
-                if (error.response && currentRetry < maxRetries) {
-                    if (retryDelay !== undefined && retryDelay > 0) {
-                        await delay(retryDelay)
-                    }
-                    
-                    return await attemptRequest(currentRetry + 1)
+            failedAttempts.push({ error: errorMessage, timestamp: new Date() })
+
+            if (currentRetry < maxRetries) {
+                if (retryDelay !== undefined && retryDelay > 0) {
+                    await delay(retryDelay)
                 }
 
-                return new HttpResponse({
-                    status: error.response?.statusCode || 500,
-                    statusText: error.response?.statusMessage || "Request Failed",
-                    body: error.response?.body || errorMessage,
-                    headers: error.response?.headers || {},
-                    attempts: currentRetry + 1,
-                    failedAttempts,
-                })
+                return await attemptRequest(currentRetry + 1)
             }
+
+            if (response) {
+                return this.toHttpResponse(response, currentRetry, failedAttempts)
+            }
+
+            return new HttpResponse({
+                status: 500,
+                statusText: "Request Failed",
+                body: errorMessage,
+                headers: {},
+                attempts: currentRetry + 1,
+                failedAttempts,
+            })
         }
 
         return await attemptRequest(retries)
+    }
+
+    protected toHttpResponse(response: Response, currentRetry: number, failedAttempts: FaliedAttempt[]): HttpResponse {
+        return new HttpResponse({
+            status: response.statusCode,
+            statusText: response.statusMessage || "",
+            headers: response.headers,
+            body: response.body,
+            attempts: currentRetry + 1,
+            failedAttempts,
+        })
     }
 
     async fetchMany({ requests, concurrency, requestDelay }: GotScrapingFetchManyOptions): Promise<HttpResponse[]> {
